@@ -1,0 +1,17 @@
+[Unit]
+Description=Storage Breaker FastAPI application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/storage-breaker
+ExecStart=/opt/storage-breaker/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3000 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

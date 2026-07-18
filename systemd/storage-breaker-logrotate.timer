@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Storage Breaker logs every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=storage-breaker-logrotate.service
+
+[Install]
+WantedBy=timers.target

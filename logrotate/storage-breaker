@@ -1,0 +1,9 @@
+/var/log/storage-breaker/application.log {
+    size 100M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 ubuntu ubuntu
+}
