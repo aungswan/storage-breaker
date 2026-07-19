@@ -1,0 +1,13 @@
+[Unit]
+Description=Upload rotated Storage Breaker logs to Amazon S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/upload-storage-breaker-logs.sh
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

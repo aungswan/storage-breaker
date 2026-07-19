@@ -1,0 +1,10 @@
+[Unit]
+Description=Upload rotated Storage Breaker logs to Amazon S3 every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+Persistent=true
+Unit=storage-breaker-s3-upload.service
+
+[Install]
+WantedBy=timers.target
