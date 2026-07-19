@@ -56,8 +56,6 @@ network. Port 3000 must not be exposed publicly.
 - Ubuntu Server 22.04 LTS EC2 instance
 - 10 GiB or larger EBS root volume
 - EC2 security group allowing TCP 22 and TCP 80
-- S3 bucket `example-bucket-2586e24b2531`
-- EC2 IAM role with access to the bucket's `storage-breaker/` prefix
 - SSH private key stored securely on the administrator's computer
 
 Protect the local SSH key:
@@ -66,53 +64,7 @@ Protect the local SSH key:
 chmod 400 mykeypair.pem
 ```
 
-Never copy permanent AWS access keys to the instance. The application uses the
-temporary credentials supplied automatically by an EC2 IAM role.
-
-## 1. Configure the S3 bucket and IAM role
-
-Keep **S3 Block All Public Access enabled**. It blocks public access but does
-not block an authenticated EC2 IAM role that has permission to use the bucket.
-
-Attach an IAM role to the EC2 instance and add this least-privilege policy to
-the role:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "UploadAndVerifyStorageBreakerLogs",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject"
-      ],
-      "Resource": "arn:aws:s3:::example-bucket-2586e24b2531/storage-breaker/*"
-    }
-  ]
-}
-```
-
-`s3:PutObject` permits upload. `s3:GetObject` is also required because the
-uploader calls `HeadObject` to verify the uploaded object's size and SHA-256
-metadata. Without it, upload can succeed but verification returns HTTP 403, so
-the fail-safe uploader retains the local file.
-
-A bucket policy is normally unnecessary when the role and bucket are in the
-same AWS account. If the bucket uses a customer-managed KMS key, the role also
-needs the appropriate KMS permissions for that key.
-
-After attaching the role, verify it from the instance:
-
-```bash
-aws sts get-caller-identity
-```
-
-Do not use `aws s3api head-bucket` as the only access test unless the role also
-has `s3:ListBucket`. The uploader intentionally does not require bucket listing.
-
-## 2. Create the application log directory
+## 1. Create the application log directory
 
 The application runs as the `ubuntu` user, so that user needs permission to
 write its log file. This single idempotent command creates the directory and
@@ -143,38 +95,24 @@ Expected result:
 drwxr-xr-x ubuntu:ubuntu /var/log/storage-breaker
 ```
 
-## 3. Deploy the application and infrastructure
+## 2. Deploy the application
 
-Clone this infrastructure repository on the instance, enter it, and run:
-
-```bash
-chmod +x scripts/setup-instance.sh
-./scripts/setup-instance.sh
-```
-
-The setup script:
-
-1. Installs Python, Git, Nginx, logrotate, and AWS CLI.
-2. Clones the FastAPI application into `/opt/storage-breaker`.
-3. Creates the Python virtual environment and installs dependencies.
-4. Creates `/var/log/storage-breaker` with the correct ownership and mode.
-5. Installs the application, logrotate, uploader, and timer units.
-6. Installs and enables the Nginx reverse-proxy site.
-7. Validates Nginx and logrotate configuration.
-8. Enables all services and timers at boot.
-9. Reloads Nginx and tests both health-check paths.
-
-The default application repository is:
-
-```text
-https://github.com/khantnaingset-kns/ape-aws-ec2-assessment-1.git
-```
-
-To deploy another fork:
+Install the application dependencies and clone the application:
 
 ```bash
-APP_REPOSITORY_URL=https://github.com/USER/REPOSITORY.git \
-  ./scripts/setup-instance.sh
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  python3 python3-venv python3-pip git
+
+sudo git clone \
+  https://github.com/khantnaingset-kns/ape-aws-ec2-assessment-1.git \
+  /opt/storage-breaker
+sudo chown -R ubuntu:ubuntu /opt/storage-breaker
+
+python3 -m venv /opt/storage-breaker/.venv
+/opt/storage-breaker/.venv/bin/pip install --upgrade pip
+/opt/storage-breaker/.venv/bin/pip install \
+  -r /opt/storage-breaker/requirements.txt
 ```
 
 ### Application systemd service
@@ -222,7 +160,110 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now storage-breaker.service
 ```
 
-## 4. Why log rotation is required
+Verify the private application endpoint before configuring Nginx:
+
+```bash
+sudo systemctl status storage-breaker --no-pager
+curl -i http://127.0.0.1:3000/health
+```
+
+### Troubleshoot the application service
+
+If the service does not start or port 3000 does not respond:
+
+```bash
+sudo systemctl status storage-breaker --no-pager
+sudo journalctl -u storage-breaker -n 100 --no-pager
+sudo ss -ltnp | grep ':3000[[:space:]]'
+```
+
+Confirm that `/opt/storage-breaker`, its virtual environment, and
+`requirements.txt` exist and are readable by `ubuntu`. After correcting a
+service file, reload systemd before restarting:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+```
+
+## 3. Configure Nginx and test the health check
+
+Install Nginx:
+
+```bash
+sudo apt-get install -y nginx
+```
+
+The complete `nginx/storage-breaker` site file is:
+
+```nginx
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+Nginx listens publicly on port 80 and forwards requests to the private Uvicorn
+listener. Install and enable the site:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  nginx/storage-breaker \
+  /etc/nginx/sites-available/storage-breaker
+
+sudo ln -sfn /etc/nginx/sites-available/storage-breaker \
+  /etc/nginx/sites-enabled/storage-breaker
+
+if [ -L /etc/nginx/sites-enabled/default ]; then
+  sudo unlink /etc/nginx/sites-enabled/default
+fi
+
+sudo nginx -t
+sudo systemctl enable --now nginx.service
+sudo systemctl reload nginx.service
+```
+
+Test Uvicorn directly, through local Nginx, and through the public address:
+
+```bash
+curl -i http://127.0.0.1:3000/health
+curl -i http://127.0.0.1/health
+curl -i http://EC2_PUBLIC_IP/health
+```
+
+Expected response:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"status":"healthy"}
+```
+
+### Fix an Nginx 404
+
+If port 3000 returns HTTP 200 but Nginx returns its own HTML 404, Nginx is
+still using the configuration loaded before the custom site was installed.
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+curl -i http://127.0.0.1/health
+```
+
+## 4. Configure log rotation as filesystem usage increases
 
 The application intentionally generates approximately 10 GiB of logs over 2.5
 hours. The EC2 root volume cannot safely keep one continuously growing file. A
@@ -339,7 +380,78 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now storage-breaker-logrotate.timer
 ```
 
+### Troubleshoot log rotation and disk usage
+
+Check the timer, service journal, current files, and root filesystem:
+
+```bash
+systemctl list-timers storage-breaker-logrotate.timer
+sudo systemctl status storage-breaker-logrotate.service --no-pager
+sudo journalctl -u storage-breaker-logrotate.service -n 100 --no-pager
+ls -lh /var/log/storage-breaker
+df -h /
+```
+
+Use debug mode to find syntax or permission problems without changing files:
+
+```bash
+sudo logrotate --debug /etc/logrotate.d/storage-breaker
+```
+
+If rotation reports `Permission denied`, verify both the directory and active
+log ownership:
+
+```bash
+stat -c '%A %U:%G %n' \
+  /var/log/storage-breaker \
+  /var/log/storage-breaker/application.log
+```
+
+The directory should be owned by `ubuntu:ubuntu`; newly created active logs
+should have mode `0640` and owner `ubuntu:ubuntu`. A rotation can exceed exactly
+100 MiB because the timer checks only once per minute.
+
 ## 5. Upload compressed rotations to S3
+
+### Configure the S3 bucket and EC2 IAM role
+
+Create or use the S3 bucket `example-bucket-2586e24b2531` and keep **S3 Block
+All Public Access enabled**. Public-access blocking does not prevent an
+authenticated EC2 IAM role from accessing the bucket.
+
+Attach an IAM role to the EC2 instance and add this least-privilege policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UploadAndVerifyStorageBreakerLogs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::example-bucket-2586e24b2531/storage-breaker/*"
+    }
+  ]
+}
+```
+
+`s3:PutObject` permits upload. `s3:GetObject` is required because `HeadObject`
+verifies the uploaded size and SHA-256 metadata. A bucket policy is normally
+unnecessary when the bucket and role are in the same AWS account.
+
+Install AWS CLI and verify the instance role:
+
+```bash
+sudo apt-get install -y awscli
+aws sts get-caller-identity
+```
+
+Never run `aws configure` with permanent IAM user keys on the instance. If the
+bucket uses a customer-managed KMS key, grant the role the necessary KMS key
+permissions as well.
 
 The custom uploader is installed as:
 
@@ -535,108 +647,11 @@ Confirm that the timer starts automatically after reboot:
 sudo systemctl enable --now storage-breaker-s3-upload.timer
 ```
 
-## 6. Verify the application and Nginx
-
-### Nginx reverse-proxy configuration
-
-The complete `nginx/storage-breaker` site file is:
-
-```nginx
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 60s;
-    }
-}
-```
-
-Nginx is the public listener on port 80 and forwards requests to the private
-Uvicorn listener. The forwarded headers preserve the original host, client IP,
-and protocol information.
-
-Install and enable the site:
-
-```bash
-sudo install -o root -g root -m 0644 \
-  nginx/storage-breaker \
-  /etc/nginx/sites-available/storage-breaker
-
-sudo ln -sfn /etc/nginx/sites-available/storage-breaker \
-  /etc/nginx/sites-enabled/storage-breaker
-
-if [ -L /etc/nginx/sites-enabled/default ]; then
-  sudo unlink /etc/nginx/sites-enabled/default
-fi
-
-sudo nginx -t
-sudo systemctl enable --now nginx.service
-sudo systemctl reload nginx.service
-```
-
-Check the services:
-
-```bash
-sudo systemctl status storage-breaker nginx
-sudo ss -ltnp | grep -E ':(80|3000)[[:space:]]'
-```
-
-Expected listeners:
-
-```text
-127.0.0.1:3000  uvicorn
-0.0.0.0:80      nginx
-```
-
-Test Uvicorn directly and then through Nginx:
-
-```bash
-curl -i http://127.0.0.1:3000/health
-curl -i http://127.0.0.1/health
-curl -i http://EC2_PUBLIC_IP/health
-```
-
-Expected response:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-
-{"status":"healthy"}
-```
-
-### Fix an Nginx 404 after deployment
-
-APT may start Nginx before the custom site is installed. `systemctl enable
---now nginx` does not reload an already-running Nginx process. In that case,
-Uvicorn returns 200 on port 3000 while Nginx still returns its own HTML 404.
-
-Validate and reload it:
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-curl -i http://127.0.0.1/health
-```
-
-The automated setup includes this reload.
-
-## 7. Troubleshooting
-
-### S3 upload succeeds but verification returns 403
+### Troubleshoot an S3 upload that verifies with 403
 
 Cause: the role has `s3:PutObject` but lacks `s3:GetObject` on the object prefix.
 
-Fix the IAM role policy using the policy in section 1, wait briefly for the IAM
+Fix the IAM role policy using the policy in this section, wait briefly for the IAM
 change to propagate, and retry:
 
 ```bash
@@ -646,7 +661,7 @@ sudo journalctl -t storage-breaker-upload -n 30 --no-pager
 
 The script keeps the local archive when verification fails.
 
-### AWS reports that credentials cannot be found
+### Troubleshoot missing AWS credentials
 
 Confirm that the IAM role is attached to the EC2 instance:
 
@@ -656,7 +671,7 @@ aws sts get-caller-identity
 
 Do not solve this by running `aws configure` with a permanent IAM user key.
 
-### Uploader service fails
+### Troubleshoot an uploader service failure
 
 ```bash
 sudo systemctl status storage-breaker-s3-upload.service
@@ -667,7 +682,7 @@ sudo journalctl -t storage-breaker-upload -n 100 --no-pager
 Files are intentionally retained locally when a run fails and will be retried
 by the next timer invocation.
 
-### Check disk usage and retained logs
+### Check retained archives during an S3 outage
 
 ```bash
 df -h /
