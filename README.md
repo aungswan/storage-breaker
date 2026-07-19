@@ -177,6 +177,51 @@ APP_REPOSITORY_URL=https://github.com/USER/REPOSITORY.git \
   ./scripts/setup-instance.sh
 ```
 
+### Application systemd service
+
+The complete `systemd/storage-breaker.service` file is:
+
+```ini
+[Unit]
+Description=Storage Breaker FastAPI application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/storage-breaker
+ExecStart=/opt/storage-breaker/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3000 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Important choices in this service are:
+
+- `User=ubuntu` and `Group=ubuntu` match the application and log-directory
+  ownership.
+- Uvicorn listens only on `127.0.0.1:3000`, so it cannot be reached directly
+  from the internet.
+- A single worker is used to stay within the memory limits of the EC2 instance.
+- `Restart=on-failure` automatically recovers from an unexpected process exit.
+- `--no-access-log` avoids duplicating Nginx access logs in the system journal.
+
+Install and activate the application service:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  systemd/storage-breaker.service \
+  /etc/systemd/system/storage-breaker.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now storage-breaker.service
+```
+
 ## 4. Why log rotation is required
 
 The application intentionally generates approximately 10 GiB of logs over 2.5
@@ -235,6 +280,63 @@ For a controlled test, force one rotation:
 ```bash
 sudo logrotate --force /etc/logrotate.d/storage-breaker
 ls -lh /var/log/storage-breaker
+```
+
+### Logrotate systemd service
+
+The complete `systemd/storage-breaker-logrotate.service` file is:
+
+```ini
+[Unit]
+Description=Rotate Storage Breaker application logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/storage-breaker
+```
+
+The service runs logrotate once and exits. Scheduling is handled separately by
+the timer.
+
+### Logrotate systemd timer
+
+The complete `systemd/storage-breaker-logrotate.timer` file is:
+
+```ini
+[Unit]
+Description=Check Storage Breaker logs every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=storage-breaker-logrotate.service
+
+[Install]
+WantedBy=timers.target
+```
+
+`OnBootSec=1min` performs the first check one minute after boot.
+`OnUnitActiveSec=1min` repeats the check every minute, and `AccuracySec=10s`
+allows systemd a small scheduling window.
+
+Install the policy, service, and timer:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  logrotate/storage-breaker \
+  /etc/logrotate.d/storage-breaker
+
+sudo install -o root -g root -m 0644 \
+  systemd/storage-breaker-logrotate.service \
+  /etc/systemd/system/storage-breaker-logrotate.service
+
+sudo install -o root -g root -m 0644 \
+  systemd/storage-breaker-logrotate.timer \
+  /etc/systemd/system/storage-breaker-logrotate.timer
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now storage-breaker-logrotate.timer
 ```
 
 ## 5. Upload compressed rotations to S3
@@ -434,6 +536,52 @@ sudo systemctl enable --now storage-breaker-s3-upload.timer
 ```
 
 ## 6. Verify the application and Nginx
+
+### Nginx reverse-proxy configuration
+
+The complete `nginx/storage-breaker` site file is:
+
+```nginx
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+Nginx is the public listener on port 80 and forwards requests to the private
+Uvicorn listener. The forwarded headers preserve the original host, client IP,
+and protocol information.
+
+Install and enable the site:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  nginx/storage-breaker \
+  /etc/nginx/sites-available/storage-breaker
+
+sudo ln -sfn /etc/nginx/sites-available/storage-breaker \
+  /etc/nginx/sites-enabled/storage-breaker
+
+if [ -L /etc/nginx/sites-enabled/default ]; then
+  sudo unlink /etc/nginx/sites-enabled/default
+fi
+
+sudo nginx -t
+sudo systemctl enable --now nginx.service
+sudo systemctl reload nginx.service
+```
 
 Check the services:
 
